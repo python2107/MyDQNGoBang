@@ -1,10 +1,17 @@
-# train.py —— 五子棋 DQN 自对弈训练（纯训练版，无 Web 界面）
+# train.py —— 五子棋 DQN 自对弈训练（纯训练版 · JSON 存档）
+#
+# 存档格式：《五子棋 DQN JSON 存档格式规范 v1》
+# 保存路径：json/gobang/{episode}/qgnn13/
+#     black.json   黑方智能体（fmt/board/hidden/epsilon/updates/model）
+#     white.json   白方智能体
+#     meta.json    训练进度（fmt/board/hidden/episode/b_wins/w_wins/draws）
+# 权重按 PyTorch 原生 (out, in) 布局存储，ESP32 端加载时自行转置。
 #
 # 用法：
 #   python train.py                     # 无限训练，Ctrl+C 退出并自动存档
 #   python train.py --episodes 5000     # 训练 5000 局后退出
 #   python train.py --log-interval 20   # 每 20 局打印一次日志
-#   python train.py --board-size 13 --seed 42
+#   python train.py --board-size 13 --hidden 256 --seed 42
 #
 import os
 import json
@@ -22,9 +29,11 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 # ===================== 参数 =====================
-BOARD_SIZE = 13
-ACTION_SIZE = BOARD_SIZE * BOARD_SIZE
-STATE_SIZE = ACTION_SIZE
+FMT          = 1                    # JSON 存档格式版本号
+BOARD_SIZE   = 13
+ACTION_SIZE  = BOARD_SIZE * BOARD_SIZE
+STATE_SIZE   = ACTION_SIZE
+HIDDEN       = 256                  # 隐藏层宽度
 
 REGION_REWARD = [
     [0.05, 0.02, 0.05],
@@ -47,10 +56,11 @@ EPSILON_DECAY = 0.995
 BATCH_SIZE = 64
 MEMORY_CAPACITY = 20000
 TARGET_UPDATE_INTERVAL = 10
-AUTO_SAVE_INTERVAL = 500          # 每多少局自动存一次档
-MAX_SAVES = 20                    # 最多保留 20 份存档，超出覆盖最旧的
-WEIGHT_ROOT = "json/bogang"
-LOG_INTERVAL = 10                 # 每多少局打印一次训练日志
+AUTO_SAVE_INTERVAL = 500
+MAX_SAVES = 20
+WEIGHT_ROOT = "json/gobang"     # 存档根目录
+SAVE_SUBDIR = "qgnn13"          # 每个存档下固定的子目录
+LOG_INTERVAL = 10
 
 os.makedirs(WEIGHT_ROOT, exist_ok=True)
 # ================================================
@@ -189,9 +199,9 @@ class GoBangGame:
 class DQN(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(STATE_SIZE, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, ACTION_SIZE)
+        self.fc1 = nn.Linear(STATE_SIZE, HIDDEN)
+        self.fc2 = nn.Linear(HIDDEN, HIDDEN)
+        self.fc3 = nn.Linear(HIDDEN, ACTION_SIZE)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -228,6 +238,7 @@ class DQNAgent:
         self.optimizer = optim.Adam(self.model.parameters(), lr=LR)
         self.memory = ReplayBuffer(MEMORY_CAPACITY)
         self.epsilon = EPSILON_START
+        self.updates = 0
 
     def act(self, state, valid_actions):
         if np.random.rand() < self.epsilon:
@@ -264,56 +275,108 @@ class DQNAgent:
         loss.backward()
         self.optimizer.step()
 
+        self.updates += 1
         if self.epsilon > EPSILON_MIN:
             self.epsilon *= EPSILON_DECAY
+        if self.updates % TARGET_UPDATE_INTERVAL == 0:
+            self.update_target()
         return loss.item()
 
     def update_target(self):
         self.target.load_state_dict(self.model.state_dict())
 
-    # ---- 权重用 torch.save 保存（比 JSON 快很多，体积也小很多）----
-    def save(self, filepath):
-        torch.save({
-            'model': self.model.state_dict(),
-            'epsilon': self.epsilon,
-        }, filepath)
+    # ---- JSON 存档 ----
+    def save_json(self, path):
+        state = {k: v.detach().cpu().numpy().tolist()
+                 for k, v in self.model.state_dict().items()}
+        payload = {
+            "fmt":     FMT,
+            "board":   BOARD_SIZE,
+            "hidden":  HIDDEN,
+            "epsilon": float(self.epsilon),
+            "updates": int(self.updates),
+            "model":   state,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
 
-    def load(self, filepath):
-        if not os.path.exists(filepath):
+    def load_json(self, path):
+        if not os.path.exists(path):
             return False
         try:
-            ckpt = torch.load(filepath, map_location=self.device, weights_only=True)
-        except TypeError:
-            ckpt = torch.load(filepath, map_location=self.device)
-        self.model.load_state_dict(ckpt['model'])
-        self.target.load_state_dict(ckpt['model'])
-        self.epsilon = ckpt.get('epsilon', EPSILON_START)
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception as e:
+            print(f"  读取 {path} 失败：{e}")
+            return False
+
+        if d.get("fmt") != FMT:
+            print(f"  {os.path.basename(path)} fmt={d.get('fmt')} 不匹配，跳过")
+            return False
+        if d.get("board") != BOARD_SIZE:
+            print(f"  {os.path.basename(path)} board={d.get('board')} "
+                  f"与当前 BOARD_SIZE={BOARD_SIZE} 不一致，跳过")
+            return False
+        if d.get("hidden") != HIDDEN:
+            print(f"  {os.path.basename(path)} hidden={d.get('hidden')} "
+                  f"与当前 HIDDEN={HIDDEN} 不一致，跳过")
+            return False
+
+        try:
+            state = {k: torch.tensor(v, dtype=torch.float32)
+                     for k, v in d["model"].items()}
+        except Exception as e:
+            print(f"  {os.path.basename(path)} model 字段解析失败：{e}")
+            return False
+
+        self.model.load_state_dict(state)
+        self.target.load_state_dict(state)
+        self.epsilon = float(d.get("epsilon", EPSILON_START))
+        self.updates = int(d.get("updates", 0))
         return True
 
 
-# --------------------------- 存档管理（最多 20 份）---------------------------
+# --------------------------- 存档管理 ---------------------------
 def list_saves():
-    """返回按局数从小到大排序的存档目录名列表。"""
+    """返回按局数排序的有效存档目录名（要求含完整 qgnn13/black.json 等）。"""
     if not os.path.isdir(WEIGHT_ROOT):
         return []
-    dirs = [d for d in os.listdir(WEIGHT_ROOT)
-            if d.isdigit() and os.path.isdir(os.path.join(WEIGHT_ROOT, d))]
+    dirs = []
+    for d in os.listdir(WEIGHT_ROOT):
+        if not d.isdigit():
+            continue
+        full = os.path.join(WEIGHT_ROOT, d, SAVE_SUBDIR)
+        if (os.path.isdir(full)
+                and os.path.exists(os.path.join(full, "black.json"))
+                and os.path.exists(os.path.join(full, "white.json"))):
+            dirs.append(d)
     return sorted(dirs, key=int)
 
 
-def save_checkpoint(agent_black, agent_white, episode):
-    save_dir = os.path.join(WEIGHT_ROOT, str(episode))
+def save_checkpoint(agent_black, agent_white, episode,
+                    b_wins, w_wins, draws):
+    """
+    按 JSON 规范写出三个文件。
+    路径：json/gobang/{episode}/qgnn13/
+        black.json / white.json / meta.json
+    """
+    save_dir = os.path.join(WEIGHT_ROOT, str(episode), SAVE_SUBDIR)
     os.makedirs(save_dir, exist_ok=True)
-    agent_black.save(os.path.join(save_dir, "black.pt"))
-    agent_white.save(os.path.join(save_dir, "white.pt"))
+
+    agent_black.save_json(os.path.join(save_dir, "black.json"))
+    agent_white.save_json(os.path.join(save_dir, "white.json"))
+
     with open(os.path.join(save_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump({
-            "episode": episode,
-            "epsilon_black": agent_black.epsilon,
-            "epsilon_white": agent_white.epsilon,
-        }, f, ensure_ascii=False, indent=2)
+            "fmt":     FMT,
+            "board":   BOARD_SIZE,
+            "hidden":  HIDDEN,
+            "episode": int(episode),
+            "b_wins":  int(b_wins),
+            "w_wins":  int(w_wins),
+            "draws":   int(draws),
+        }, f)
 
-    # 超过 20 份就删掉最旧的
     saves = list_saves()
     while len(saves) > MAX_SAVES:
         oldest = saves.pop(0)
@@ -338,25 +401,38 @@ class Trainer:
 
         self._load_latest()
 
-    # ---------- 存档 ----------
     def _load_latest(self):
         saves = list_saves()
         if not saves:
             return
         latest = saves[-1]
-        d = os.path.join(WEIGHT_ROOT, latest)
-        b = os.path.join(d, "black.pt")
-        w = os.path.join(d, "white.pt")
+        d = os.path.join(WEIGHT_ROOT, latest, SAVE_SUBDIR)
+        b = os.path.join(d, "black.json")
+        w = os.path.join(d, "white.json")
+        m = os.path.join(d, "meta.json")
         try:
-            if os.path.exists(b) and os.path.exists(w):
-                self.agent_black.load(b)
-                self.agent_white.load(w)
-                self.episode = int(latest)
-                print(f"已加载存档 {latest}，从第 {self.episode} 局继续训练")
+            ok_b = self.agent_black.load_json(b)
+            ok_w = self.agent_white.load_json(w)
+            if not (ok_b and ok_w):
+                print(f"存档 {latest} 加载失败，从头开始")
+                return
+
+            self.episode = int(latest)
+            if os.path.exists(m):
+                try:
+                    with open(m, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    self.black_wins = int(meta.get("b_wins", 0))
+                    self.white_wins = int(meta.get("w_wins", 0))
+                    self.draws      = int(meta.get("draws",  0))
+                except Exception as e:
+                    print(f"  读取 meta.json 失败：{e}")
+
+            print(f"已加载存档 {latest}（第 {self.episode} 局），"
+                  f"黑胜 {self.black_wins} / 白胜 {self.white_wins} / 平 {self.draws}")
         except Exception as e:
             print("加载存档失败，从头开始：", e)
 
-    # ---------- 单局自对弈 ----------
     def play_episode(self):
         game = self.game
         game.reset()
@@ -375,12 +451,12 @@ class Trainer:
             action = agent.act(state, valid)
             reward, done = game.make_move(action)
             next_state = game.get_state()
-            history.append((player, state.copy(), action, reward, next_state.copy(), done))
+            history.append((player, state.copy(), action, reward,
+                            next_state.copy(), done))
             self.move_count += 1
 
         winner = game.winner
 
-        # 结算：获胜方最后一步 +1
         for p, s, a, r, ns, d in history:
             total = r + (1.0 if d and winner == p else 0.0)
             if p == 1:
@@ -388,7 +464,6 @@ class Trainer:
             else:
                 self.agent_white.remember(s, a, total, ns, d)
 
-        # 真训练
         loss_b = self.agent_black.replay()
         loss_w = self.agent_white.replay()
         losses = [l for l in (loss_b, loss_w) if l is not None]
@@ -403,15 +478,12 @@ class Trainer:
         else:
             self.draws += 1
 
-        if self.episode % TARGET_UPDATE_INTERVAL == 0:
-            self.agent_black.update_target()
-            self.agent_white.update_target()
-
         if self.episode % AUTO_SAVE_INTERVAL == 0:
-            d = save_checkpoint(self.agent_black, self.agent_white, self.episode)
+            d = save_checkpoint(self.agent_black, self.agent_white,
+                                self.episode,
+                                self.black_wins, self.white_wins, self.draws)
             print(f"  → 已保存到 {d}（当前存档数 {len(list_saves())}/{MAX_SAVES}）")
 
-    # ---------- 日志 ----------
     def log(self, session_start_episode, session_start_time):
         done_eps = max(self.episode - session_start_episode, 1)
         elapsed = time.time() - session_start_time
@@ -427,12 +499,15 @@ class Trainer:
             f"{elapsed/done_eps:.3f}s/局"
         )
 
-    # ---------- 主循环 ----------
     def run(self, total_episodes=0, log_interval=LOG_INTERVAL):
         device = self.agent_black.device
         print("=" * 78)
-        print(f"五子棋 DQN 自对弈训练（纯训练版）")
-        print(f"设备: {device} | 棋盘: {BOARD_SIZE}x{BOARD_SIZE} | 起始局数: {self.episode}")
+        print("五子棋 DQN 自对弈训练（纯训练版 · JSON 存档 v1）")
+        print(f"设备: {device} | 棋盘: {BOARD_SIZE}x{BOARD_SIZE} | "
+              f"HIDDEN: {HIDDEN} | 起始局数: {self.episode}")
+        print(f"存档根目录: {os.path.abspath(WEIGHT_ROOT)}")
+        print(f"单档结构: {WEIGHT_ROOT}/{{episode}}/{SAVE_SUBDIR}/"
+              f"{{black.json, white.json, meta.json}}")
         if total_episodes:
             print(f"计划训练 {total_episodes} 局后退出")
         else:
@@ -453,34 +528,44 @@ class Trainer:
             traceback.print_exc()
             print("训练异常中断，正在保存存档...")
         finally:
-            d = save_checkpoint(self.agent_black, self.agent_white, self.episode)
-            print(f"已保存到 {d}（第 {self.episode} 局），当前存档数 {len(list_saves())}/{MAX_SAVES}")
+            d = save_checkpoint(self.agent_black, self.agent_white,
+                                self.episode,
+                                self.black_wins, self.white_wins, self.draws)
+            print(f"已保存到 {d}（第 {self.episode} 局），"
+                  f"当前存档数 {len(list_saves())}/{MAX_SAVES}")
 
 
 # --------------------------- 入口 ---------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="五子棋 DQN 自对弈训练（纯训练版）")
+    p = argparse.ArgumentParser(
+        description="五子棋 DQN 自对弈训练（纯训练版 · JSON 存档 v1）")
     p.add_argument("--episodes", type=int, default=0,
                    help="训练总局数，0 表示无限训练（默认 0）")
     p.add_argument("--log-interval", type=int, default=LOG_INTERVAL,
                    help=f"每多少局打印一次日志（默认 {LOG_INTERVAL}）")
     p.add_argument("--board-size", type=int, default=BOARD_SIZE,
                    help=f"棋盘边长（默认 {BOARD_SIZE}）")
+    p.add_argument("--hidden", type=int, default=HIDDEN,
+                   help=f"隐藏层宽度（默认 {HIDDEN}）")
     p.add_argument("--seed", type=int, default=None, help="随机种子（可选）")
     p.add_argument("--weight-root", type=str, default=WEIGHT_ROOT,
                    help=f"存档根目录（默认 {WEIGHT_ROOT}）")
+    p.add_argument("--save-subdir", type=str, default=SAVE_SUBDIR,
+                   help=f"每个存档下的固定子目录（默认 {SAVE_SUBDIR}）")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # 允许通过命令行覆盖全局常量（必须在创建任何 Agent / Game 之前）
-    global BOARD_SIZE, ACTION_SIZE, STATE_SIZE, WEIGHT_ROOT
+    global BOARD_SIZE, ACTION_SIZE, STATE_SIZE, HIDDEN
+    global WEIGHT_ROOT, SAVE_SUBDIR
     BOARD_SIZE = args.board_size
     ACTION_SIZE = BOARD_SIZE * BOARD_SIZE
     STATE_SIZE = ACTION_SIZE
+    HIDDEN = args.hidden
     WEIGHT_ROOT = args.weight_root
+    SAVE_SUBDIR = args.save_subdir
     os.makedirs(WEIGHT_ROOT, exist_ok=True)
 
     if args.seed is not None:
