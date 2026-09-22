@@ -2,147 +2,404 @@
 
 > 五子棋 DQN 自对弈训练项目（中文说明）
 
-本仓库实现了一个基于 DQN（Deep Q-Network）的五子棋自对弈训练框架，包含三种运行模式：
+本仓库是一个基于 DQN（Deep Q-Network）的五子棋自对弈训练框架，目标是让两个智能体在 13x13 棋盘上持续自我对弈并学习更强的落子策略。项目目前包含三种核心运行方式：
 
-- GUI：基于 Tkinter 的可视化训练界面（GUI/main.py）。适合观察训练过程、手动保存/加载权重。
-- NoGUI/Console：纯命令行训练脚本（NoGUI/Console/main.py），适合长期在服务器/终端运行并自动存档。
-- NoGUI/Flask：带简单网页展示的后台训练服务（NoGUI/Flask/main.py），模块加载即开始训练，可通过网页查看训练进度和棋盘。
+- GUI：Tkinter 图形界面训练，适合本地观察训练过程和手动控制。
+- NoGUI/Console：纯命令行训练，适合后台挂机训练、长时间跑任务和自动保存。
+- NoGUI/Micropython_for_esp32：适用于 ESP32-S3/MicroPython 设备的低资源版本，支持在单片机上训练并保留 JSON 权重格式。
 
-代码使用 Python（以 3.8+ 为佳），主要依赖：PyTorch、NumPy，Flask（仅用于 NoGUI/Flask）。
-
----
-
-## 快速开始
-
-1. 克隆仓库：
-
-   git clone https://github.com/python2107/MyDQNGoBang.git
-   cd MyDQNGoBang
-
-2. 安装依赖（建议使用虚拟环境）：
-
-- 若只运行命令行或 GUI：
-
-  pip install torch numpy
-
-- 若运行 Flask Web 版：
-
-  pip install -r NoGUI/Flask/requirements.txt
-
-说明：PyTorch 请根据你的平台（CUDA / CPU）从 https://pytorch.org/ 选择合适的安装命令。
+说明：当前仓库中没有 `NoGUI/Flask` 目录；如果旧文档里出现这个目录，属于历史说明或未同步文档。当前维护的主流程为 GUI / Console / ESP32 三种模式。
 
 ---
 
-## 目录结构（简要）
+## 1. 项目概览
 
-- GUI/main.py              - Tkinter 可视化训练界面
-- NoGUI/Console/main.py   - 纯训练命令行脚本
-- NoGUI/Flask/main.py     - Flask 后台训练并提供网页展示
-- NoGUI/Flask/requirements.txt - Flask 版依赖清单
-- LICENSE
+这个项目的核心思路是：
 
----
-
-## 使用说明
-
-### GUI（可视化）
-
-运行：
-
-  python GUI/main.py
-
-功能要点：
-- 点击“开始训练”开始自对弈训练；可暂停、继续、停止。
-- 支持“后台极速模式”不刷新棋盘以节省显示开销并加速训练。
-- 可通过“加载轮数”输入框加载 `json/bogang/<轮数>/black.json` 和 `white.json`（GUI 使用 JSON 存储权重）。
-- 点击“保存权重”会将当前轮数的权重保存到 `json/bogang/<轮数>/`。
-
-注意：GUI 版本为了兼容简单的跨平台运行，保存格式为 JSON，体积和速度比不上二进制的 torch 保存方式。
-
-### NoGUI/Console（命令行训练）
-
-运行：
-
-  python NoGUI/Console/main.py [--episodes N] [--log-interval M] [--board-size S] [--seed SEED] [--weight-root PATH]
-
-示例：
-
-  python NoGUI/Console/main.py --episodes 5000 --log-interval 20
-
-功能要点：
-- 适合在服务器上长时间训练。
-- 自动加载最新存档（若存在），并在达到 AUTO_SAVE_INTERVAL（默认 500 局）时自动保存。
-- 权重使用 PyTorch 二进制文件保存：`json/bogang/<轮数>/black.pt` 和 `white.pt`，并包含 `meta.json`。
-- 会保留最多 20 份存档（可在脚本中调整 MAX_SAVES）。
-
-### NoGUI/Flask（网页展示）
-
-运行：
-
-  cd NoGUI/Flask
-  pip install -r requirements.txt
-  python main.py
-
-然后打开浏览器访问：
-
-  http://127.0.0.1:5000/
-
-特点：
-- 后台训练线程会在模块加载时自动启动（即便无人访问也会训练）。
-- 提供 `/api/state` 接口返回当前训练快照，网页定时拉取并渲染。
-- 同样在 `json/bogang/` 下保存二进制权重和 meta 信息。
+- 五子棋状态通过一个平铺的一维特征表示，输入到 DQN 网络；
+- 每个落子都对应一个动作值 Q(s, a)；
+- 两个智能体黑白双方同时学习，互相博弈提高策略；
+- 训练会记录权重快照 (`black.json` / `white.json` / `meta.json`) 以便恢复训练；
+- 代码中加入了棋型奖励、区域奖励和威胁惩罚，帮助模型更快学会“围堵/进攻/防守”。
 
 ---
 
-## 权重和存档说明
+## 2. 目录结构
 
-- 存档根目录：`json/bogang/`（默认，可通过命令行参数覆盖）。
-- GUI：每个存档目录下使用 `black.json`、`white.json`（JSON 格式，较大且慢）。
-- Console/Flask：每个存档目录下使用 `black.pt`、`white.pt`（PyTorch 二进制，推荐在长期训练中使用），并有 `meta.json` 记录一些元信息。
-- 存档命名为完成的局数（例如 `json/bogang/1500/`）。程序会按数字顺序管理并清理最旧的存档以保持不超过 MAX_SAVES。
+```text
+MyDQNGoBang/
+├── README.md
+├── LICENSE
+├── GUI/
+│   ├── main.py
+│   └── requirements.txt
+├── NoGUI/
+│   ├── Console/
+│   │   └── main.py
+│   └── Micropython_for_esp32/
+│       ├── main.py
+│       ├── esp32_has_ulab_v1.29.bin
+│       └── ESP32_GENERIC_S3-SPIRAM_OCT-20260824-v1.29.0 (1).bin
+└── json/                  # 训练生成的权重/快照目录（第一次训练时自动创建）
+```
 
----
+说明：
 
-## 可配置项（常见）
-
-- BOARD_SIZE：棋盘大小，默认 13（代码中可更改或通过命令行参数覆盖）。
-- AUTO_SAVE_INTERVAL：自动保存的局数间隔（默认 500）。
-- MEMORY_CAPACITY、BATCH_SIZE、LR、GAMMA、EPSILON_DECAY 等均在脚本顶部定义为超参数，可按需调优。
-
----
-
-## 代码说明（高层）
-
-- 游戏环境：GoBangGame 实现了棋盘状态、合法动作、落子规则、胜负判断、棋型奖励与对手威胁检测。
-- DQN网络：简单的全连接网络（多层全连接 + ReLU），输入为扁平化棋盘，输出为每个格子的 Q 值。
-- 训练策略：自对弈，两方均使用 DQNAgent；经验缓存（ReplayBuffer）做随机采样，使用目标网络（target network）并定期同步。
-- 奖励设计：结合九宫格区域奖励（鼓励靠中间/关键区域）、棋型奖励（活四、冲四、活三等）与对手威胁惩罚。
-
----
-
-## 开发与贡献
-
-欢迎提交 Issue 或 Pull Request：
-- 如果你改进了网络结构、奖励函数或训练策略，欢迎提交 PR。
-- 若希望加入对局回放、对弈对外接口或强化训练监控（TensorBoard / WandB），也欢迎讨论。
+- `GUI/main.py`：可视化训练界面，适合电脑本地跑训练；
+- `NoGUI/Console/main.py`：无界面训练脚本，适合服务器/后台训练；
+- `NoGUI/Micropython_for_esp32/main.py`：ESP32 版训练脚本，适合在资源受限设备上运行；
+- `json/gobang/...`：训练存档目录，由程序自动写入，默认保存格式为 JSON。
 
 ---
 
-## 常见问题（FAQ）
+## 3. 运行环境
 
-Q: 为什么训练���慢？
-- A: 如果使用 CPU，训练会比较慢；建议安装支持 CUDA 的 PyTorch 并在带 GPU 的机器上运行。
-- A: GUI 模式默认会频繁刷新界面，开启“后台极速模式”可以显著提升速度。
+建议使用 Python 3.8+ / 3.10+，并创建虚拟环境。
 
-Q: 权重格式不兼容怎么办？
-- A: GUI 使用 JSON 存储，Console/Flask 使用 PyTorch二进制（.pt）；在不同模式间切换加载时需注意格式是否匹配。
+### 3.1 通用依赖
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Linux/macOS
+# 或 .venv\Scripts\activate  # Windows
+
+pip install torch numpy
+```
+
+### 3.2 GUI 版额外说明
+
+Tkinter 是 Python 自带的 GUI 库，通常随 Python 安装包一起提供。若在某些 Linux 环境中缺失，可安装：
+
+```bash
+sudo apt-get install python3-tk
+```
+
+### 3.3 ESP32/MicroPython 版说明
+
+该目录下提供了 MicroPython 固件文件：
+
+- `esp32_has_ulab_v1.29.bin`
+- `ESP32_GENERIC_S3-SPIRAM_OCT-20260824-v1.29.0 (1).bin`
+
+这些固件可用于 ESP32-S3 等目标板，前者带 `ulab`，更适合数值计算加速。给 ESP32 烧录 MicroPython 后，再把 `NoGUI/Micropython_for_esp32/main.py` 上传到板子中运行即可。
 
 ---
 
-## 许可
+## 4. 快速开始
 
-本仓库包含 LICENSE 文件，请查看 LICENSE 了解开源许可和使用条款。
+### 4.1 方式一：GUI 训练（最直观）
+
+```bash
+git clone https://github.com/python2107/MyDQNGoBang.git
+cd MyDQNGoBang
+pip install torch numpy
+python GUI/main.py
+```
+
+运行后：
+
+- 左侧/上方通常会显示棋盘和训练状态；
+- 可点击“开始训练”开始自对弈；
+- 可暂停/继续/停止；
+- 可手动保存和加载模型；
+- 程序会把训练快照保存到 `json/gobang/<局数>/qgnn13/`。
+
+GUI 版保存格式是 JSON，便于可视化和调试；对应文件：
+
+```text
+json/gobang/1500/qgnn13/
+├── black.json
+├── white.json
+├── meta.json
+```
+
+说明：
+
+- GUI 版为了方便跨平台和展示，采用 JSON 存档；
+- 这类文件比 `.pt` 更容易观察和调试；
+- 训练中断后，可直接从最新快照恢复继续训练。
 
 ---
 
-感谢使用与关注！如需我把此 README 提交到仓库（创建 README.md），我可以帮你完成提交。
+### 4.2 方式二：命令行训练（服务器/后台最佳）
+
+在项目根目录运行：
+
+```bash
+python NoGUI/Console/main.py
+```
+
+这会启动无限训练，直到手动 Ctrl+C 停止。默认会自动保存快照。
+
+#### 4.2.1 常见参数
+
+```bash
+python NoGUI/Console/main.py --episodes 5000
+python NoGUI/Console/main.py --log-interval 20
+python NoGUI/Console/main.py --board-size 13 --hidden 256 --seed 42
+python NoGUI/Console/main.py --weight-root json/gobang --save-subdir qgnn13
+```
+
+参数说明：
+
+- `--episodes`：总训练局数，0 表示无限训练；
+- `--log-interval`：每多少局打印一次日志；
+- `--board-size`：棋盘大小，默认 13；
+- `--hidden`：隐藏层宽度，默认 256；
+- `--seed`：随机种子，方便复现实验；
+- `--weight-root`：存档根目录；
+- `--save-subdir`：每个快照目录下的子目录名，默认 `qgnn13`。
+
+#### 4.2.2 训练日志示例
+
+```text
+[第      20 局] 黑胜     8 (40.0%) / 白胜     9 (45.0%) / 平     3 | ε 0.9571 | loss 0.1234 | 经验池   128 | 0.421s/局
+```
+
+含义：
+
+- 当前第 20 局；
+- 黑胜 8、白胜 9、平 3；
+- ε 表示探索率；
+- loss 为训练损失；
+- 经验池大小表示 replay buffer 中的样本数量。
+
+#### 4.2.3 自动保存规则
+
+脚本默认会在每 500 局自动保存一次（`AUTO_SAVE_INTERVAL = 500`）。
+
+生成目录类似：
+
+```text
+json/gobang/500/qgnn13/
+├── black.json
+├── white.json
+├── meta.json
+```
+
+最多保留 `MAX_SAVES` 份快照（默认 20），旧快照会被自动删除，防止磁盘被占满。
+
+---
+
+### 4.3 方式三：ESP32 / MicroPython 训练
+
+这是一个适配到单片机的轻量化版本，特点是：
+
+- 通过 `ulab`（当固件中带有 ulab 时）加速矩阵运算；
+- 适合在 ESP32-S3 等资源受限平台上训练；
+- 存档仍然使用 JSON 格式，和 PC 版兼容；
+- 能在设备上自动恢复进度、周期性保存并持续训练。
+
+#### 4.3.1 烧录固件
+
+使用你最合适的工具把 MicroPython 固件烧录进 ESP32。示例：
+
+```bash
+esptool.py --chip esp32s3 --port /dev/ttyUSB0 write_flash -z 0x0 esp32_has_ulab_v1.29.bin
+```
+
+#### 4.3.2 上传代码和权重
+
+把 `NoGUI/Micropython_for_esp32/main.py` 传到 ESP32 中，并确保其能访问 `SAVE_DIR = "/qgnn13"`。常见目录结构：
+
+```text
+/qgnn13/
+├── black.json
+├── white.json
+├── meta.json
+```
+
+在 Thonny / mpremote / WebREPL 中运行：
+
+```python
+import main
+```
+
+启动后，程序会：
+
+- 自动读取 `meta.json` 恢复最新进度；
+- 如果没有现成模型，则从随机初始化开始；
+- 每隔 `AUTO_SAVE_INTERVAL` 局自动保存；
+- 每隔 `LOG_INTERVAL` 局输出训练状态；
+- 可通过 Ctrl+C 或重启中断并保留当前进度。
+
+#### 4.3.3 ESP32 版 注意事项
+
+- ESP32 的内存远小于电脑，因此该版使用更小的 batch 和 replay 缓冲；
+- `BATCH_SIZE = 4`，`MEMORY_CAPACITY = 300`，这是为了避免内存溢出；
+- 该版适合在开发板上演示训练，而非高性能研究训练；
+- 如果使用强力版固件（如带 `ulab`），训练会比纯基础固件更快。
+
+---
+
+## 5. 存档与恢复机制
+
+这个项目的权重按“快照”保存。每个快照目录中都包含：
+
+```text
+<weight_root>/<episode>/<save_subdir>/
+├── black.json
+├── white.json
+├── meta.json
+```
+
+其中：
+
+- `black.json`：黑方 DQN 网络参数；
+- `white.json`：白方 DQN 网络参数；
+- `meta.json`：训练统计���息，比如 `episode`、`b_wins`、`w_wins`、`draws`。
+
+### 恢复训练
+
+程序会扫描 `json/gobang` 下的所有数字目录，选择最新的有效快照。加载成功后：
+
+- 程序从该快照恢复网络参数；
+- 恢复历史胜负记录；
+- 继续后续训练，不会从头开始。
+
+例如：
+
+```text
+json/gobang/
+├── 100/
+│   └── qgnn13/
+│       ├── black.json
+│       ├── white.json
+│       └── meta.json
+├── 500/
+│   └── qgnn13/
+│       ├── black.json
+│       ├── white.json
+│       └── meta.json
+└── 1000/
+    └── qgnn13/
+        ├── black.json
+        ├── white.json
+        └── meta.json
+```
+
+若现在运行训练，程序通常会从 `1000` 目录继续。
+
+---
+
+## 6. 训练原理概述
+
+### 6.1 状态表示
+
+棋盘用 13x13 的二维矩阵表示，然后展平成一维输入：
+
+- 自己落子位置记为 `1`；
+- 对手落子位置记为 `-1`；
+- 空位记为 `0`。
+
+因此每个状态的输入维度约为：
+
+```text
+13 * 13 = 169
+```
+
+### 6.2 网络结构
+
+代码中采用的是一个简单的前馈 DQN：
+
+```text
+输入 169 -> 隐藏层 256 -> 隐藏层 256 -> 输出 169
+```
+
+输出 169 对应棋盘中每一个落点的 Q 值，网络最终选择一个最优落子位置。
+
+### 6.3 奖励设计
+
+奖励并不只是“赢了加分/输了扣分”，而是融合了：
+
+- 九宫格区域奖励：鼓励棋子靠近中心和关键区域；
+- 棋型奖励：如活四、冲四、活三、眠三、活二；
+- 对手威胁惩罚：对对手即将成型的危险局势做惩罚；
+- 胜负判定：一局结束时给出额外的终局奖励。
+
+这让模型更容易学会“进攻”和“制止对手威胁”。
+
+---
+
+## 7. 常见问题（FAQ）
+
+### Q1：训练很慢怎么办？
+
+A：
+
+- CPU 上训练会明显慢；建议使用 NVIDIA GPU 环境并安装对应版本的 PyTorch；
+- GUI 模式会刷新界面，界面占用较大，训练速度可能偏慢；
+- 目前 `NoGUI/Console` 更适合长时间后台训练；
+- 对于 ESP32，应该理解它是“轻量实验/演示训练”，不是高性能实战训练环境。
+
+### Q2：为什么存档目录里是 `black.json`、`white.json`、`meta.json`？
+
+A：因为本项目是双智能体自对弈，每个智能体有一份网络参数；再加上一份训练状态说明文件。这样可以在训练中断后恢复精确状态。
+
+### Q3：GUI 版和 Console 版能互相加载吗？
+
+A：可以在同一套 JSON 规范下大致兼容，但最好保持相同的：
+
+- `BOARD_SIZE`
+- `HIDDEN`
+- `FMT_VERSION`
+- `SAVE_ROOT` / `SAVE_SUBDIR`
+
+如果参数不一致，程序会拒绝加载，避免错误的权重覆盖。
+
+### Q4：我想从指定轮次恢复训练？
+
+A：直接把目标快照目录放回默认保存目录即可，程序会自动加载最新快照；如果你希望手动固定某一轮次，最简单办法是：
+
+- 复制该快照文件到对应目录；
+- 或者手动运行脚本并确认 `json/gobang` 下最近目录的内容。
+
+### Q5：我能更改棋盘大小吗？
+
+A：可以。多数脚本都允许通过命令行参数覆盖：
+
+```bash
+python NoGUI/Console/main.py --board-size 9
+```
+
+不过注意：如果修改棋盘大小，训练结果、网络尺寸和存档兼容性都要重新评估。
+
+---
+
+## 8. 说明与建议
+
+### 8.1 适合场景
+
+- 学习 DQN 与强化学习：适合
+- 看训练曲线和交互式调参：GUI 最方便
+- 长时间后台训练：Console 最合适
+- 低资源硬件部署：ESP32/MicroPython 版本最合适
+
+### 8.2 建议工作流
+
+1. 先用 GUI 或 Console 在本机跑几百轮观察效果；
+2. 确认训练稳定后，再用 Console 进行长时间训练；
+3. 若需要在嵌入式平台演示或验证，可使用 ESP32 版；
+4. 通过 `meta.json` 记录胜率/平局/总轮数，便于比较不同超参数的训练效果。
+
+---
+
+## 9. 许可证
+
+本仓库包含 `LICENSE` 文件，使用前请阅读并遵守其许可条款。
+
+---
+
+## 10. 结语
+
+MyDQNGoBang 的核心价值在于：它把强化学习、五子棋规则、模型保存和视觉化训练都整合在一个比较完整的 Python 项目中，适合：
+
+- 学习 DQN 自对弈；
+- 研究棋类强化学习；
+- 做训练可视化演示；
+- 作为嵌入式 AI 实验平台。
+
+如果你愿意，我还可以继续帮你做两件事中的任意一件：
+
+1. 把 README 再优化成更正式的 GitHub 风格排版；
+2. 直接补一份 `运行示意图 + 训练流程图` 的增强版说明文档。
