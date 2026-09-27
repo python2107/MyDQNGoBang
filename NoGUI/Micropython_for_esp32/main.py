@@ -17,7 +17,7 @@ import ulab.numpy as np
 
 # ==================== 全局配置 ====================
 BOARD_SIZE   = 13
-HIDDEN       = 256
+HIDDEN       = 128
 ACTION_SIZE  = BOARD_SIZE * BOARD_SIZE       # 169
 STATE_SIZE   = ACTION_SIZE
 
@@ -37,7 +37,7 @@ BATCH_SIZE      = 4          # PC 版是 64；ESP32 上 4 足够且不 OOM
 MEMORY_CAPACITY = 300        # PC 版是 20000
 REPLAY_STEPS    = 4          # 每次 learn 做几次梯度更新
 
-AUTO_SAVE_INTERVAL = 1     # 每 N 局保存一次（写 JSON 慢，别太频繁）
+AUTO_SAVE_INTERVAL = 100     # 每 N 局保存一次（写 JSON 慢，别太频繁）
 LOG_INTERVAL       = 5
 GC_INTERVAL        = 20
 MIN_MEM_TO_LEARN   = BATCH_SIZE * 4

@@ -14,7 +14,7 @@ from collections import deque
 
 # ==================== 全局配置 ====================
 BOARD_SIZE   = 13
-HIDDEN       = 256
+HIDDEN       = 128 #规格
 ACTION_SIZE  = BOARD_SIZE * BOARD_SIZE
 STATE_SIZE   = ACTION_SIZE
 

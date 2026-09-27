@@ -1,14 +1,22 @@
 # ============================================================
-#  五子棋 DQN 训练 (ESP32-S3 · 13x13 · 纯 Python 无 ulab) - 修复版
+#  五子棋 DQN 训练 (ESP32-S3 · 13x13 · 纯 Python 无 ulab) - 终极稳定版
 #  JSON 存档 v1 · 与 PC 版 train.py 完全互通
 #  存档: /qgnn13/black.json  /qgnn13/white.json  /qgnn13/meta.json
 # ============================================================
-import os, json, time, random, gc, math
+import os, json, time, random, gc, math, machine
 from array import array
+from machine import Pin
+from neopixel import NeoPixel
+
+# ==================== 硬件配置 ====================
+pin = Pin(48, Pin.OUT)       # ESP32-S3 板载 NeoPixel 通常是 GPIO48
+np = NeoPixel(pin, 1)        
+np[0] = (0, 0, 0)
+np.write()
 
 # ==================== 全局配置 ====================
 BOARD_SIZE  = 13
-HIDDEN      = 256  # 【关键修复】从 256 降至 64，纯 Python 跑 256 需要数秒一次前向传播
+HIDDEN      = 128  # 128 维
 ACTION_SIZE = BOARD_SIZE * BOARD_SIZE
 STATE_SIZE  = ACTION_SIZE
 FMT_VERSION = 1
@@ -24,8 +32,9 @@ TARGET_UPDATE_INTERVAL = 10
 MEMORY_CAPACITY = 200
 REPLAY_STEPS    = 3
 MIN_MEM_TO_LEARN = 20
+MEM_THRESHOLD   = 150000  # 内存安全阈值 150KB，低于此值自动清理并重启
 
-AUTO_SAVE_INTERVAL = 10
+AUTO_SAVE_INTERVAL = 100  # 改回 100 局保存一次
 LOG_INTERVAL       = 1
 GC_INTERVAL        = 5
 
@@ -47,14 +56,60 @@ try:
 except OSError:
     pass
 
-# 【新增】调整 GC 阈值，减少频繁垃圾回收
 gc.threshold(100000)
 gc.collect()
-# ==================================================
 
-# -------------------- 工具 --------------------
+# ==================== 灯光状态控制 ====================
+COLOR_INIT    = (50, 0, 50)   # 紫色：初始化
+COLOR_LOAD    = (50, 25, 0)   # 橙色：加载中
+COLOR_TRAIN   = (0, 0, 50)    # 蓝色：训练中
+COLOR_WIN_B   = (50, 0, 0)    # 红色：黑胜
+COLOR_WIN_W   = (0, 50, 0)    # 绿色：白胜
+COLOR_WIN_D   = (50, 50, 50)  # 白色：平局
+COLOR_SAVE    = (50, 50, 0)   # 黄色：保存中
+COLOR_ERROR   = (50, 0, 0)    # 红色：错误
+
+# 【关键修复】声明为全局变量
+led_off_timestamp = 0  
+
+def led_set(color):
+    np[0] = color
+    np.write()
+
+def led_off():
+    np[0] = (0, 0, 0)
+    np.write()
+
+def led_flash_block(color, delay_ms=100):
+    """阻塞式闪烁（仅用于错误提示和初始化）"""
+    led_set(color)
+    time.sleep_ms(delay_ms)
+    led_off()
+
+def led_status_win(player):
+    """非阻塞记录颜色，并在主循环中0.1秒后自动关闭"""
+    global led_off_timestamp
+    if player == 1:
+        led_set(COLOR_WIN_B)
+    elif player == 2:
+        led_set(COLOR_WIN_W)
+    else:
+        led_set(COLOR_WIN_D)
+    # 设定 100ms 后关灯
+    led_off_timestamp = time.ticks_add(time.ticks_ms(), 100)
+
+def handle_error_and_restart(msg):
+    """发生严重错误或保存失败：红灯闪1分钟，然后自动重启"""
+    print("!!! 发生严重错误: %s !!!" % msg)
+    end_time = time.ticks_add(time.ticks_ms(), 60000) # 1分钟
+    while time.ticks_diff(time.ticks_ms(), end_time) < 0:
+        led_flash_block(COLOR_ERROR, 50)
+        time.sleep_ms(50)
+    print("红灯闪烁完毕，自动重启...")
+    machine.reset()
+
+# -------------------- 工具函数 --------------------
 def _file_exists(path):
-    """【修复】MicroPython 没有 os.path.exists，使用 os.stat 替代"""
     try:
         os.stat(path)
         return True
@@ -62,8 +117,6 @@ def _file_exists(path):
         return False
 
 def _make_gauss_array(size, scale):
-    """【修复】一次性生成高斯分布数组，避免函数调用开销和 print 阻塞"""
-    import math, random
     return array('f', [
         math.sqrt(-2.0 * math.log(max(random.random(), 1e-10))) * 
         math.cos(2.0 * math.pi * random.random()) * scale 
@@ -75,7 +128,6 @@ def _flatten_2d(nested):
     for row in nested:
         out.extend(row)
     return out
-
 
 # -------------------- 游戏环境 --------------------
 class GoBangGame:
@@ -96,7 +148,6 @@ class GoBangGame:
         self.winner = None
 
     def get_state(self):
-        """当前走子方视角: 自己 +1, 对手 -1, 空 0。返回 list(float) 长度 N。"""
         p = self.current
         opp = 3 - p
         b = self.board
@@ -214,7 +265,6 @@ class GoBangGame:
             self.current = opp
         return total_reward, done
 
-
 # -------------------- Q 网络 --------------------
 class QNet:
     def __init__(self, n_in, n_out, h):
@@ -225,7 +275,6 @@ class QNet:
         s1 = (2.0 / n_in) ** 0.5
         s2 = (2.0 / h) ** 0.5
 
-        # 【修复】使用一次性列表推导，替代 _gauss 循环调用
         self.W1 = _make_gauss_array(h * n_in, s1)
         self.b1 = array('f', [0.0] * h)
         self.W2 = _make_gauss_array(h * h, s2)
@@ -233,7 +282,6 @@ class QNet:
         self.W3 = _make_gauss_array(n_out * h, s2)
         self.b3 = array('f', [0.0] * n_out)
         
-        # 【修复】预分配前向传播缓存，避免频繁申请内存
         self.z1 = [0.0] * h
         self.a1 = [0.0] * h
         self.z2 = [0.0] * h
@@ -242,11 +290,9 @@ class QNet:
         print("QNet is inited.")
 
     def forward(self, x):
-        """x: list(float) 长度 n_in。返回 (q, cache)。"""
         n_in = self.n_in; n_out = self.n_out; h = self.h
         W1 = self.W1; b1 = self.b1; W2 = self.W2; b2 = self.b2; W3 = self.W3; b3 = self.b3
         
-        # 复用预分配缓存
         z1 = self.z1; a1 = self.a1
         z2 = self.z2; a2 = self.a2
         q  = self.q
@@ -274,7 +320,6 @@ class QNet:
                 s += W3[base + k] * a2[k]
             q[i] = s
 
-        # 返回切片拷贝，防止缓存被后续 forward 覆盖导致 DQN 更新出错
         return q[:], (x[:], z1[:], a1[:], z2[:], a2[:])
 
     def forward_q(self, x):
@@ -282,11 +327,9 @@ class QNet:
         return q
 
     def backward(self, cache, action, td, lr):
-        """单样本 SGD。td = q[action] - target。"""
         x, z1, a1, z2, a2 = cache
         h = self.h; n_in = self.n_in; n_out = self.n_out
 
-        # ---- 输出层 ----
         base_a = action * h
         dA2 = [0.0] * h
         for k in range(h):
@@ -295,13 +338,11 @@ class QNet:
             self.W3[base_a + k] = w - lr * td * a2[k]
         self.b3[action] -= lr * td
 
-        # ReLU 反向
         dZ2 = [0.0] * h
         for i in range(h):
             if z2[i] > 0.0:
                 dZ2[i] = dA2[i]
 
-        # ---- 第二隐层 ----
         dA1 = [0.0] * h
         for i in range(h):
             dzi = dZ2[i]
@@ -319,7 +360,6 @@ class QNet:
             if z1[i] > 0.0:
                 dZ1[i] = dA1[i]
 
-        # ---- 第一隐层 ----
         for i in range(h):
             dzi = dZ1[i]
             if dzi == 0.0:
@@ -337,7 +377,6 @@ class QNet:
         self.W3 = array('f', other.W3)
         self.b3 = array('f', other.b3)
 
-    # ---- JSON 序列化 ----
     def to_json_dict(self):
         n_in = self.n_in; h = self.h; n_out = self.n_out
         W1 = self.W1; W2 = self.W2; W3 = self.W3
@@ -357,7 +396,6 @@ class QNet:
         self.b2 = array('f', d["fc2.bias"])
         self.W3 = array('f', _flatten_2d(d["fc3.weight"]))
         self.b3 = array('f', d["fc3.bias"])
-
 
 # -------------------- DQN Agent --------------------
 class DQNAgent:
@@ -430,6 +468,7 @@ class DQNAgent:
         if path is None:
             path = self.save_path
         print("  正在保存到 %s ..." % path)
+        led_set(COLOR_SAVE) # 黄灯常亮
         payload = {
             "fmt":     FMT_VERSION,
             "board":   BOARD_SIZE,
@@ -440,12 +479,13 @@ class DQNAgent:
         }
         with open(path, "w") as f:
             json.dump(payload, f)
-        gc.collect() # 【修复】保存后强制回收内存
+        gc.collect()
+        led_off() # 保存完毕，关灯
 
     def load_json(self, path=None):
         if path is None:
             path = self.save_path
-        if not _file_exists(path): # 【修复】使用 _file_exists
+        if not _file_exists(path):
             print("  [加载] %s 不存在，跳过。" % path)
             return False
         try:
@@ -472,9 +512,8 @@ class DQNAgent:
         self.updates = int(d.get("updates", 0))
         print("  [加载] %s 成功 (ε=%.4f, updates=%d)"
               % (path, self.epsilon, self.updates))
-        gc.collect() # 【修复】加载后强制回收内存
+        gc.collect()
         return True
-
 
 # -------------------- meta.json --------------------
 def save_meta(path, episode, b_wins, w_wins, draws):
@@ -486,7 +525,7 @@ def save_meta(path, episode, b_wins, w_wins, draws):
         }, f)
 
 def load_meta(path):
-    if not _file_exists(path): # 【修复】使用 _file_exists
+    if not _file_exists(path):
         return None
     try:
         with open(path, "r") as f:
@@ -499,12 +538,13 @@ def load_meta(path):
         return None
     return d
 
-
 # -------------------- 单局 --------------------
 def train_step(agent_b, agent_w, game):
     game.reset()
     history = []
     moves = 0
+    led_set(COLOR_TRAIN) # 蓝灯常亮，训练中
+    
     while game.winner is None:
         p = game.current
         agent = agent_b if p == 1 else agent_w
@@ -521,16 +561,15 @@ def train_step(agent_b, agent_w, game):
 
     winner = game.winner
     for p, s, a, r, ns, done in history:
-        # 【关键修复】赢棋给 +1.0，输棋给 -1.0，平局给 0.0
         if done:
             if winner == p:
-                total = r + 1.0   # 赢棋奖励
+                total = r + 1.0
             elif winner == 0:
-                total = r          # 平局
+                total = r
             else:
-                total = r - 1.0   # 输棋惩罚
+                total = r - 1.0
         else:
-            total = r             # 中间步数只给形状奖励
+            total = r
             
         if p == 1:
             agent_b.remember(s, a, total, ns, done)
@@ -541,11 +580,18 @@ def train_step(agent_b, agent_w, game):
     lw = agent_w.learn()
     losses = [l for l in (lb, lw) if l is not None]
     avg_loss = sum(losses) / len(losses) if losses else 0.0
+    
+    led_status_win(winner) # 非阻塞闪烁：根据胜负颜色（0.1秒后自动关）
     return winner, moves, avg_loss
-
 
 # -------------------- 主循环 --------------------
 def main():
+    # 【最关键修复】声明全局变量，防止 UnboundLocalError
+    global led_off_timestamp
+    
+    print("Code is starting.")
+    led_flash_block(COLOR_INIT, 200) # 初始化：紫灯闪烁
+    
     game = GoBangGame()
     black_path = SAVE_DIR + "/black.json"
     white_path = SAVE_DIR + "/white.json"
@@ -565,6 +611,7 @@ def main():
         print("[meta] 恢复进度: episode=%d, 黑胜=%d, 白胜=%d, 平=%d"
               % (episode, b_wins, w_wins, draws))
 
+    led_flash_block(COLOR_LOAD, 200) # 加载：橙灯闪烁
     ok_b = agent_b.load_json(black_path)
     ok_w = agent_w.load_json(white_path)
     if not (ok_b and ok_w):
@@ -585,6 +632,28 @@ def main():
 
     try:
         while True:
+            # --- 内存检查与自动重启 ---
+            if gc.mem_free() < MEM_THRESHOLD:
+                print("!!! 内存不足 (%d) !!!" % gc.mem_free())
+                print("清理回放池并尝试保存...")
+                agent_b.memory = []
+                agent_w.memory = []
+                gc.collect()
+                try:
+                    agent_b.save_json(black_path)
+                    agent_w.save_json(white_path)
+                    save_meta(meta_path, episode, b_wins, w_wins, draws)
+                    print("保存成功，自动重启中...")
+                except Exception as e:
+                    handle_error_and_restart("内存不足保存失败: %s" % e)
+                machine.reset()
+
+            # --- 非阻塞关闭 LED ---
+            if led_off_timestamp > 0 and time.ticks_diff(time.ticks_ms(), led_off_timestamp) >= 0:
+                led_off()
+                led_off_timestamp = 0
+
+            # --- 正常训练一局 ---
             winner, moves, avg_loss = train_step(agent_b, agent_w, game)
             episode += 1
             if winner == 1:
@@ -616,10 +685,13 @@ def main():
 
             if episode % AUTO_SAVE_INTERVAL == 0:
                 print("==== 自动保存 @ %d 局 ====" % episode)
-                agent_b.save_json(black_path)
-                agent_w.save_json(white_path)
-                save_meta(meta_path, episode, b_wins, w_wins, draws)
-                print("==== 保存完成 ====")
+                try:
+                    agent_b.save_json(black_path)
+                    agent_w.save_json(white_path)
+                    save_meta(meta_path, episode, b_wins, w_wins, draws)
+                    print("==== 保存完成 ====")
+                except Exception as e:
+                    handle_error_and_restart("自动保存失败: %s" % e)
 
             if episode % GC_INTERVAL == 0:
                 gc.collect()
@@ -627,15 +699,17 @@ def main():
     except KeyboardInterrupt:
         print("\n手动中断，保存 @ %d 局 ..." % episode)
     except Exception as e:
-        print("\n异常中断: %s" % repr(e))
+        handle_error_and_restart("训练主循环异常: %s" % e)
     finally:
-        agent_b.save_json(black_path)
-        agent_w.save_json(white_path)
-        save_meta(meta_path, episode, b_wins, w_wins, draws)
-        print("已保存到 %s (第 %d 局)" % (SAVE_DIR, episode))
-
+        # 确保任何退出都尝试保存
+        try:
+            gc.collect()
+            agent_b.save_json(black_path)
+            agent_w.save_json(white_path)
+            save_meta(meta_path, episode, b_wins, w_wins, draws)
+            print("已保存到 %s (第 %d 局)" % (SAVE_DIR, episode))
+        except Exception as e:
+            handle_error_and_restart("最终保存失败: %s" % e)
 
 if __name__ == "__main__":
-    print("Code is starting.")
     main()
-

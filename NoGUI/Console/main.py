@@ -1,6 +1,7 @@
 # ============================================================
 #  五子棋 DQN 训练主程序 (13 路) —— 稳定版
 #  存档路径：json/gobang/{局数}/qgnn13/{black,white,meta}.json
+#  pc版
 # ============================================================
 import os
 import json
@@ -14,7 +15,7 @@ from collections import deque
 
 # ==================== 全局配置 ====================
 BOARD_SIZE   = 13
-HIDDEN       = 256
+HIDDEN       = 128 #规模
 ACTION_SIZE  = BOARD_SIZE * BOARD_SIZE
 STATE_SIZE   = ACTION_SIZE
 
