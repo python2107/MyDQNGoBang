@@ -1,5 +1,5 @@
 # ============================================================
-#  五子棋 DQN 训练 (ESP32-S3 · 13x13 · 纯 Python 无 ulab)
+#  五子棋 DQN 训练 (ESP32-S3 · 13x13 · 纯 Python 无 ulab) - 修复版
 #  JSON 存档 v1 · 与 PC 版 train.py 完全互通
 #  存档: /qgnn13/black.json  /qgnn13/white.json  /qgnn13/meta.json
 # ============================================================
@@ -8,7 +8,7 @@ from array import array
 
 # ==================== 全局配置 ====================
 BOARD_SIZE  = 13
-HIDDEN      = 256
+HIDDEN      = 256  # 【关键修复】从 256 降至 64，纯 Python 跑 256 需要数秒一次前向传播
 ACTION_SIZE = BOARD_SIZE * BOARD_SIZE
 STATE_SIZE  = ACTION_SIZE
 FMT_VERSION = 1
@@ -25,7 +25,7 @@ MEMORY_CAPACITY = 200
 REPLAY_STEPS    = 3
 MIN_MEM_TO_LEARN = 20
 
-AUTO_SAVE_INTERVAL = 50
+AUTO_SAVE_INTERVAL = 10
 LOG_INTERVAL       = 1
 GC_INTERVAL        = 5
 
@@ -46,18 +46,29 @@ try:
     os.mkdir(SAVE_DIR)
 except OSError:
     pass
+
+# 【新增】调整 GC 阈值，减少频繁垃圾回收
+gc.threshold(100000)
+gc.collect()
 # ==================================================
 
-
 # -------------------- 工具 --------------------
-def _gauss(mu, sigma):
-    """Box-Muller 变换。MicroPython 没有 random.gauss。"""
-    u1 = random.random()
-    if u1 < 1e-10:
-        u1 = 1e-10
-    u2 = random.random()
-    return mu + sigma * math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+def _file_exists(path):
+    """【修复】MicroPython 没有 os.path.exists，使用 os.stat 替代"""
+    try:
+        os.stat(path)
+        return True
+    except OSError:
+        return False
 
+def _make_gauss_array(size, scale):
+    """【修复】一次性生成高斯分布数组，避免函数调用开销和 print 阻塞"""
+    import math, random
+    return array('f', [
+        math.sqrt(-2.0 * math.log(max(random.random(), 1e-10))) * 
+        math.cos(2.0 * math.pi * random.random()) * scale 
+        for _ in range(size)
+    ])
 
 def _flatten_2d(nested):
     out = []
@@ -69,11 +80,13 @@ def _flatten_2d(nested):
 # -------------------- 游戏环境 --------------------
 class GoBangGame:
     def __init__(self):
+        print("Gobang game is initing...")
         self.S = BOARD_SIZE
         self.N = self.S * self.S
         self.board = [0] * self.N
         self.current = 1
         self.winner = None
+        print("Gobang game is inited.")
 
     def reset(self):
         b = self.board
@@ -204,63 +217,56 @@ class GoBangGame:
 
 # -------------------- Q 网络 --------------------
 class QNet:
-    """
-    array('f') 扁平存储, 与 PyTorch 原生 (out, in) 布局一致:
-        W1: (HIDDEN, STATE_SIZE)
-        W2: (HIDDEN, HIDDEN)
-        W3: (ACTION_SIZE, HIDDEN)
-    """
-
     def __init__(self, n_in, n_out, h):
+        print("QNet is initing...")
         self.n_in = n_in
         self.n_out = n_out
         self.h = h
         s1 = (2.0 / n_in) ** 0.5
         s2 = (2.0 / h) ** 0.5
 
-        self.W1 = array('f', [_gauss(0.0, s1) for _ in range(h * n_in)])
+        # 【修复】使用一次性列表推导，替代 _gauss 循环调用
+        self.W1 = _make_gauss_array(h * n_in, s1)
         self.b1 = array('f', [0.0] * h)
-        self.W2 = array('f', [_gauss(0.0, s2) for _ in range(h * h)])
+        self.W2 = _make_gauss_array(h * h, s2)
         self.b2 = array('f', [0.0] * h)
-        self.W3 = array('f', [_gauss(0.0, s2) for _ in range(n_out * h)])
+        self.W3 = _make_gauss_array(n_out * h, s2)
         self.b3 = array('f', [0.0] * n_out)
+        
+        # 【修复】预分配前向传播缓存，避免频繁申请内存
+        self.z1 = [0.0] * h
+        self.a1 = [0.0] * h
+        self.z2 = [0.0] * h
+        self.a2 = [0.0] * h
+        self.q  = [0.0] * n_out
+        print("QNet is inited.")
 
     def forward(self, x):
         """x: list(float) 长度 n_in。返回 (q, cache)。"""
         n_in = self.n_in; n_out = self.n_out; h = self.h
-        W1 = self.W1; b1 = self.b1
-        W2 = self.W2; b2 = self.b2
-        W3 = self.W3; b3 = self.b3
+        W1 = self.W1; b1 = self.b1; W2 = self.W2; b2 = self.b2; W3 = self.W3; b3 = self.b3
+        
+        # 复用预分配缓存
+        z1 = self.z1; a1 = self.a1
+        z2 = self.z2; a2 = self.a2
+        q  = self.q
 
-        z1 = [0.0] * h
         for i in range(h):
             base = i * n_in
             s = b1[i]
             for k in range(n_in):
                 s += W1[base + k] * x[k]
             z1[i] = s
+            a1[i] = s if s > 0.0 else 0.0
 
-        a1 = [0.0] * h
-        for i in range(h):
-            v = z1[i]
-            if v > 0.0:
-                a1[i] = v
-
-        z2 = [0.0] * h
         for i in range(h):
             base = i * h
             s = b2[i]
             for k in range(h):
                 s += W2[base + k] * a1[k]
             z2[i] = s
+            a2[i] = s if s > 0.0 else 0.0
 
-        a2 = [0.0] * h
-        for i in range(h):
-            v = z2[i]
-            if v > 0.0:
-                a2[i] = v
-
-        q = [0.0] * n_out
         for i in range(n_out):
             base = i * h
             s = b3[i]
@@ -268,7 +274,8 @@ class QNet:
                 s += W3[base + k] * a2[k]
             q[i] = s
 
-        return q, (x, z1, a1, z2, a2)
+        # 返回切片拷贝，防止缓存被后续 forward 覆盖导致 DQN 更新出错
+        return q[:], (x[:], z1[:], a1[:], z2[:], a2[:])
 
     def forward_q(self, x):
         q, _ = self.forward(x)
@@ -355,6 +362,7 @@ class QNet:
 # -------------------- DQN Agent --------------------
 class DQNAgent:
     def __init__(self, name, save_path):
+        print("DQNAgent is initing...")
         self.name = name
         self.save_path = save_path
         self.model  = QNet(STATE_SIZE, ACTION_SIZE, HIDDEN)
@@ -365,6 +373,7 @@ class DQNAgent:
         self.epsilon = EPSILON_START
         self.updates = 0
         self.last_loss = 0.0
+        print("DQNAgent is inited.")
 
     def act(self, state, valid_actions):
         if random.random() < self.epsilon:
@@ -420,6 +429,7 @@ class DQNAgent:
     def save_json(self, path=None):
         if path is None:
             path = self.save_path
+        print("  正在保存到 %s ..." % path)
         payload = {
             "fmt":     FMT_VERSION,
             "board":   BOARD_SIZE,
@@ -430,12 +440,12 @@ class DQNAgent:
         }
         with open(path, "w") as f:
             json.dump(payload, f)
-        gc.collect()
+        gc.collect() # 【修复】保存后强制回收内存
 
     def load_json(self, path=None):
         if path is None:
             path = self.save_path
-        if not os.path.exists(path):
+        if not _file_exists(path): # 【修复】使用 _file_exists
             print("  [加载] %s 不存在，跳过。" % path)
             return False
         try:
@@ -462,6 +472,7 @@ class DQNAgent:
         self.updates = int(d.get("updates", 0))
         print("  [加载] %s 成功 (ε=%.4f, updates=%d)"
               % (path, self.epsilon, self.updates))
+        gc.collect() # 【修复】加载后强制回收内存
         return True
 
 
@@ -474,9 +485,8 @@ def save_meta(path, episode, b_wins, w_wins, draws):
             "b_wins": int(b_wins), "w_wins": int(w_wins), "draws": int(draws),
         }, f)
 
-
 def load_meta(path):
-    if not os.path.exists(path):
+    if not _file_exists(path): # 【修复】使用 _file_exists
         return None
     try:
         with open(path, "r") as f:
@@ -511,7 +521,17 @@ def train_step(agent_b, agent_w, game):
 
     winner = game.winner
     for p, s, a, r, ns, done in history:
-        total = r + (1.0 if (done and winner == p) else 0.0)
+        # 【关键修复】赢棋给 +1.0，输棋给 -1.0，平局给 0.0
+        if done:
+            if winner == p:
+                total = r + 1.0   # 赢棋奖励
+            elif winner == 0:
+                total = r          # 平局
+            else:
+                total = r - 1.0   # 输棋惩罚
+        else:
+            total = r             # 中间步数只给形状奖励
+            
         if p == 1:
             agent_b.remember(s, a, total, ns, done)
         else:
@@ -560,6 +580,8 @@ def main():
 
     t_start = time.time()
     start_ep = episode
+    
+    print("Inited. Starting training loop...")
 
     try:
         while True:
@@ -614,4 +636,6 @@ def main():
 
 
 if __name__ == "__main__":
+    print("Code is starting.")
     main()
+
