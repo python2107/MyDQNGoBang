@@ -1,198 +1,44 @@
 # ============================================================
-#  五子棋 DQN 训练主程序 (13 路)
-#  存档路径：json/gobang/{局数}/qgnn13/{black,white,meta}.json
+#  五子棋 GUI 对弈程序 —— 适配 main.py（控制台训练版）的 JSON 存档
+#
+#  读取路径：json/gobang/{episode}/qgnn13/{black,white,meta}.json
+#
+#  与训练脚本严格保持一致的部分：
+#    * 棋盘 13 路，输入 13*13=169 维展平
+#    * 状态编码：黑棋=+1，白棋=-1（绝对视角，不做翻转）
+#    * 动作编码：idx = row * 13 + col
+#    * 网络结构：169 -> 128 -> 128 -> 169 (ReLU)
+#    * 校验字段：fmt=1 / board=13 / hidden=128
 # ============================================================
 import os
 import json
-import random
+import tkinter as tk
+from tkinter import ttk, messagebox
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-from collections import deque
 
-# ==================== 全局配置 ====================
-BOARD_SIZE   = 13
-HIDDEN       = 128 #规格
-ACTION_SIZE  = BOARD_SIZE * BOARD_SIZE
-STATE_SIZE   = ACTION_SIZE
+# ==================== 与训练脚本一致的配置 ====================
+BOARD_SIZE  = 13
+HIDDEN      = 128
+ACTION_SIZE = BOARD_SIZE * BOARD_SIZE
+STATE_SIZE  = ACTION_SIZE
+FMT_VERSION = 1
 
-FMT_VERSION  = 1
-SAVE_ROOT    = "json/gobang"        # 存档根目录
-SUB_DIR      = "qgnn13"             # 每个快照下的子目录
-AUTO_SAVE_INTERVAL = 500            # 每 N 局自动保存一次
+SAVE_ROOT = "json/gobang"
+SUB_DIR   = "qgnn13"
 
-# 九宫格奖励
-REGION_REWARD = [
-    [0.05, 0.02, 0.05],
-    [0.02, 0.10, 0.02],
-    [0.05, 0.02, 0.05],
-]
-# 棋型奖励
-SHAPE_REWARD = {
-    'live_four':   0.5,
-    'rush_four':   0.2,
-    'live_three':  0.1,
-    'sleep_three': 0.02,
-    'live_two':    0.01,
-}
-# 对手威胁惩罚
-THREAT_PENALTY = {
-    'live_four':  -0.5,
-    'rush_four':  -0.2,
-    'live_three': -0.1,
-}
-
-# DQN 超参数
-LR              = 0.001
-GAMMA           = 0.99
-EPSILON_START   = 1.0
-EPSILON_MIN     = 0.01
-EPSILON_DECAY   = 0.995
-BATCH_SIZE      = 64
-MEMORY_CAPACITY = 20000
-TARGET_UPDATE_INTERVAL = 10
-
-os.makedirs(SAVE_ROOT, exist_ok=True)
-# ==================================================
+# ==================== 界面参数 ====================
+CELL     = 42
+MARGIN   = 36
+BOARD_PX = MARGIN * 2 + CELL * (BOARD_SIZE - 1)
 
 
-def snapshot_dir(episode):
-    """返回某局数的存档目录：json/gobang/{episode}/qgnn13/"""
-    return os.path.join(SAVE_ROOT, str(episode), SUB_DIR)
-
-
-# -------------------- 游戏环境 --------------------
-class GoBangGame:
-    def __init__(self):
-        self.size = BOARD_SIZE
-        self.board = None
-        self.current_player = None
-        self.winner = None
-        self.reset()
-
-    def reset(self):
-        self.board = [[0] * self.size for _ in range(self.size)]
-        self.current_player = 1
-        self.winner = None
-        return self.get_state()
-
-    def get_state(self):
-        s = np.zeros((self.size, self.size), dtype=np.float32)
-        for i in range(self.size):
-            for j in range(self.size):
-                if self.board[i][j] == 1:
-                    s[i][j] = 1
-                elif self.board[i][j] == 2:
-                    s[i][j] = -1
-        return s
-
-    def get_valid_actions_idx(self):
-        return [i * self.size + j
-                for i in range(self.size)
-                for j in range(self.size)
-                if self.board[i][j] == 0]
-
-    def get_shape_reward(self, i, j, player):
-        reward = 0.0
-        for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
-            length = 1
-            open_ends = 0
-            x, y = i + dx, j + dy
-            while 0 <= x < self.size and 0 <= y < self.size and self.board[x][y] == player:
-                length += 1; x += dx; y += dy
-            if 0 <= x < self.size and 0 <= y < self.size and self.board[x][y] == 0:
-                open_ends += 1
-            x, y = i - dx, j - dy
-            while 0 <= x < self.size and 0 <= y < self.size and self.board[x][y] == player:
-                length += 1; x -= dx; y -= dy
-            if 0 <= x < self.size and 0 <= y < self.size and self.board[x][y] == 0:
-                open_ends += 1
-
-            if length >= 5:
-                continue
-            elif length == 4:
-                if open_ends == 2:   reward += SHAPE_REWARD['live_four']
-                elif open_ends == 1: reward += SHAPE_REWARD['rush_four']
-            elif length == 3:
-                if open_ends == 2:   reward += SHAPE_REWARD['live_three']
-                elif open_ends == 1: reward += SHAPE_REWARD['sleep_three']
-            elif length == 2 and open_ends == 2:
-                reward += SHAPE_REWARD['live_two']
-        return reward
-
-    def get_opponent_threat_penalty(self, opponent):
-        penalty = 0.0
-        for i in range(self.size):
-            for j in range(self.size):
-                if self.board[i][j] != opponent:
-                    continue
-                for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
-                    x, y = i - dx, j - dy
-                    if 0 <= x < self.size and 0 <= y < self.size and self.board[x][y] == opponent:
-                        continue
-                    length = 0
-                    x, y = i, j
-                    while 0 <= x < self.size and 0 <= y < self.size and self.board[x][y] == opponent:
-                        length += 1; x += dx; y += dy
-                    open_ends = 0
-                    x1, y1 = i - dx, j - dy
-                    if 0 <= x1 < self.size and 0 <= y1 < self.size and self.board[x1][y1] == 0:
-                        open_ends += 1
-                    x2, y2 = i + (length - 1) * dx + dx, j + (length - 1) * dy + dy
-                    if 0 <= x2 < self.size and 0 <= y2 < self.size and self.board[x2][y2] == 0:
-                        open_ends += 1
-
-                    if length >= 5:
-                        continue
-                    if length == 4:
-                        if open_ends == 2:   penalty += THREAT_PENALTY['live_four']
-                        elif open_ends == 1: penalty += THREAT_PENALTY['rush_four']
-                    elif length == 3 and open_ends == 2:
-                        penalty += THREAT_PENALTY['live_three']
-        return penalty
-
-    def make_move(self, action_idx):
-        i = action_idx // self.size
-        j = action_idx % self.size
-        if self.board[i][j] != 0:
-            return 0.0, False
-        self.board[i][j] = self.current_player
-
-        region_i = min(i // (self.size // 3), 2)
-        region_j = min(j // (self.size // 3), 2)
-        region_reward = REGION_REWARD[region_i][region_j]
-        shape_reward = self.get_shape_reward(i, j, self.current_player)
-        opponent = 3 - self.current_player
-        threat_penalty = self.get_opponent_threat_penalty(opponent)
-        total_reward = region_reward + shape_reward + threat_penalty
-
-        done = False
-        if self.check_winner(i, j):
-            self.winner = self.current_player
-            done = True
-        elif len(self.get_valid_actions_idx()) == 0:
-            self.winner = 0
-            done = True
-        else:
-            self.current_player = opponent
-        return total_reward, done
-
-    def check_winner(self, i, j):
-        player = self.board[i][j]
-        for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
-            cnt = 1
-            for step in (1, -1):
-                x, y = i + dx * step, j + dy * step
-                while 0 <= x < self.size and 0 <= y < self.size and self.board[x][y] == player:
-                    cnt += 1; x += dx * step; y += dy * step
-            if cnt >= 5:
-                return True
-        return False
-
-
-# -------------------- DQN 网络 --------------------
+# ------------------------------------------------------------
+#  网络结构（必须与训练脚本完全相同，否则权重加载失败）
+# ------------------------------------------------------------
 class DQN(nn.Module):
     def __init__(self):
         super().__init__()
@@ -206,277 +52,379 @@ class DQN(nn.Module):
         return self.fc3(x)
 
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-
-    def push(self, s, a, r, ns, d):
-        self.buffer.append((s, a, r, ns, d))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states      = torch.FloatTensor(np.array([e[0].flatten() for e in batch]))
-        actions     = torch.LongTensor(np.array([e[1] for e in batch]))
-        rewards     = torch.FloatTensor(np.array([e[2] for e in batch]))
-        next_states = torch.FloatTensor(np.array([e[3].flatten() for e in batch]))
-        dones       = torch.BoolTensor(np.array([e[4] for e in batch]))
-        return states, actions, rewards, next_states, dones
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-# -------------------- DQN Agent --------------------
-class DQNAgent:
-    def __init__(self, name="agent"):
-        self.name = name
+# ------------------------------------------------------------
+#  推理 Agent（只做贪心决策，不做任何探索）
+# ------------------------------------------------------------
+class Agent:
+    def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = DQN().to(self.device)
-        self.target = DQN().to(self.device)
-        self.target.load_state_dict(self.model.state_dict())
-        self.optimizer = optim.Adam(self.model.parameters(), lr=LR)
-        self.memory = ReplayBuffer(MEMORY_CAPACITY)
-        self.epsilon = EPSILON_START
+        self.model.eval()
+        self.epsilon = 0.0
         self.updates = 0
+        self.loaded = False
+
+    def load_json(self, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"找不到权重文件：\n{path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+
+        # —— 与训练脚本 save_json / load_json 相同的校验 ——
+        if d.get("fmt") != FMT_VERSION:
+            raise ValueError(f"{path}\nfmt 不匹配：{d.get('fmt')} != {FMT_VERSION}")
+        if d.get("board") != BOARD_SIZE:
+            raise ValueError(f"{path}\nboard 不匹配：{d.get('board')} != {BOARD_SIZE}")
+        if d.get("hidden") != HIDDEN:
+            raise ValueError(f"{path}\nhidden 不匹配：{d.get('hidden')} != {HIDDEN}")
+
+        state = {k: torch.tensor(v) for k, v in d["model"].items()}
+        self.model.load_state_dict(state)
+        self.model.eval()
+
+        self.epsilon = float(d.get("epsilon", 0.0))
+        self.updates = int(d.get("updates", 0))
+        self.loaded = True
+        return d
 
     def act(self, state, valid_actions):
-        if np.random.rand() < self.epsilon:
-            return random.choice(valid_actions)
+        """state: (13,13) float32；valid_actions: List[int]；返回落子索引。"""
         with torch.no_grad():
-            st = torch.FloatTensor(state.flatten()).unsqueeze(0).to(self.device)
+            st = torch.FloatTensor(np.asarray(state, dtype=np.float32).flatten())
+            st = st.unsqueeze(0).to(self.device)
             q = self.model(st).cpu().numpy().flatten()
+
         valid_set = set(valid_actions)
         for idx in range(ACTION_SIZE):
             if idx not in valid_set:
                 q[idx] = -np.inf
         return int(np.argmax(q))
 
-    def remember(self, s, a, r, ns, d):
-        self.memory.push(s, a, r, ns, d)
 
-    def replay(self):
-        if len(self.memory) < BATCH_SIZE:
-            return None
-        states, actions, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
-        states      = states.to(self.device)
-        actions     = actions.to(self.device)
-        rewards     = rewards.to(self.device)
-        next_states = next_states.to(self.device)
-        dones       = dones.to(self.device)
+# ------------------------------------------------------------
+#  主界面
+# ------------------------------------------------------------
+class GoBangGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("五子棋 · DQN 对弈（13 路）")
+        self.root.resizable(False, False)
 
-        current_q = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        with torch.no_grad():
-            next_q = self.target(next_states).max(1)[0]
-            target_q = rewards + (1 - dones.float()) * GAMMA * next_q
-        loss = F.mse_loss(current_q, target_q)
+        # 对局状态
+        self.board = [[0] * BOARD_SIZE for _ in range(BOARD_SIZE)]
+        self.current = 1
+        self.winner = None
+        self.human_color = 1
+        self.last_move = None
+        self.history = []
+        self.busy = False
+        self.game_id = 0
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        self.agent_black = Agent()
+        self.agent_white = Agent()
+        self.model_info = "未载入模型"
 
-        if self.epsilon > EPSILON_MIN:
-            self.epsilon *= EPSILON_DECAY
-        self.updates += 1
+        self._build_ui()
+        self.refresh_snapshots()
 
-        return loss.item()
+    # ---------------- UI 构建 ----------------
+    def _build_ui(self):
+        top = ttk.Frame(self.root, padding=(8, 6))
+        top.pack(side=tk.TOP, fill=tk.X)
 
-    def update_target(self):
-        self.target.load_state_dict(self.model.state_dict())
+        ttk.Label(top, text="快照：").pack(side=tk.LEFT)
+        self.snap_var = tk.StringVar()
+        self.snap_combo = ttk.Combobox(top, textvariable=self.snap_var,
+                                       width=8, state="readonly")
+        self.snap_combo.pack(side=tk.LEFT)
+        self.snap_combo.bind("<<ComboboxSelected>>", lambda e: self.load_selected())
 
-    # ---------- 规范 v1：保存 ----------
-    def save_json(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        state = {k: v.cpu().numpy().tolist()
-                 for k, v in self.model.state_dict().items()}
-        payload = {
-            "fmt":     FMT_VERSION,
-            "board":   BOARD_SIZE,
-            "hidden":  HIDDEN,
-            "epsilon": float(self.epsilon),
-            "updates": int(self.updates),
-            "model":   state,
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        size_kb = os.path.getsize(path) / 1024
-        print(f"  [保存] {path}  ({size_kb:.1f} KB, ε={self.epsilon:.4f}, updates={self.updates})")
+        ttk.Button(top, text="刷新", width=6,
+                   command=self.refresh_snapshots).pack(side=tk.LEFT, padx=3)
+        ttk.Button(top, text="载入", width=6,
+                   command=self.load_selected).pack(side=tk.LEFT)
 
-    # ---------- 规范 v1：加载 ----------
-    def load_json(self, path):
-        if not os.path.exists(path):
-            print(f"  [加载] {path} 不存在，跳过。")
-            return False
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-        except Exception as e:
-            print(f"  [加载] JSON 解析失败：{e}")
-            return False
+        ttk.Label(top, text="   模式：").pack(side=tk.LEFT)
+        self.mode_var = tk.StringVar(value="human_black")
+        self.mode_combo = ttk.Combobox(
+            top, textvariable=self.mode_var, width=12, state="readonly",
+            values=["human_black", "human_white", "ai_vs_ai"])
+        self.mode_combo.pack(side=tk.LEFT)
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda e: self.new_game())
 
-        if d.get("fmt") != FMT_VERSION:
-            print(f"  [加载] fmt 不匹配：{d.get('fmt')} != {FMT_VERSION}，跳过。")
-            return False
-        if d.get("board") != BOARD_SIZE:
-            print(f"  [加载] board 不匹配：{d.get('board')} != {BOARD_SIZE}，跳过。")
-            return False
-        if d.get("hidden") != HIDDEN:
-            print(f"  [加载] hidden 不匹配：{d.get('hidden')} != {HIDDEN}，跳过。")
-            return False
+        ttk.Button(top, text="新对局", width=8,
+                   command=self.new_game).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="悔棋", width=6,
+                   command=self.undo).pack(side=tk.LEFT)
 
-        try:
-            state = {k: torch.tensor(v) for k, v in d["model"].items()}
-            self.model.load_state_dict(state)
-            self.target.load_state_dict(state)
-        except Exception as e:
-            print(f"  [加载] 权重载入失败：{e}")
-            return False
+        self.canvas = tk.Canvas(self.root, width=BOARD_PX, height=BOARD_PX,
+                                bg="#E3C08D", highlightthickness=0)
+        self.canvas.pack(padx=8, pady=(0, 6))
+        self.canvas.bind("<Button-1>", self.on_click)
 
-        self.epsilon = float(d.get("epsilon", EPSILON_START))
-        self.updates = int(d.get("updates", 0))
-        print(f"  [加载] {path} 成功  (ε={self.epsilon:.4f}, updates={self.updates})")
-        return True
+        self.status_var = tk.StringVar()
+        ttk.Label(self.root, textvariable=self.status_var, anchor="w",
+                  padding=(10, 5)).pack(side=tk.BOTTOM, fill=tk.X)
 
+    # ---------------- 快照管理 ----------------
+    @staticmethod
+    def find_snapshots():
+        if not os.path.isdir(SAVE_ROOT):
+            return []
+        eps = []
+        for d in os.listdir(SAVE_ROOT):
+            if d.isdigit() and os.path.isdir(os.path.join(SAVE_ROOT, d, SUB_DIR)):
+                eps.append(int(d))
+        return sorted(eps)
 
-# -------------------- meta.json 读写 --------------------
-def save_meta(path, episode, b_wins, w_wins, draws):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = {
-        "fmt":     FMT_VERSION,
-        "board":   BOARD_SIZE,
-        "hidden":  HIDDEN,
-        "episode": int(episode),
-        "b_wins":  int(b_wins),
-        "w_wins":  int(w_wins),
-        "draws":   int(draws),
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-
-
-def load_meta(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception:
-        return None
-    if d.get("fmt") != FMT_VERSION or d.get("board") != BOARD_SIZE or d.get("hidden") != HIDDEN:
-        print("  [meta] 校验失败，忽略旧进度。")
-        return None
-    return d
-
-
-def find_latest_snapshot():
-    """扫描 SAVE_ROOT 下所有数字目录，返回最大局数。"""
-    if not os.path.isdir(SAVE_ROOT):
-        return 0
-    eps = [int(d) for d in os.listdir(SAVE_ROOT)
-           if d.isdigit() and os.path.isdir(os.path.join(SAVE_ROOT, d))]
-    return max(eps) if eps else 0
-
-
-# -------------------- 训练一轮 --------------------
-def train_step(agent_black, agent_white, game):
-    game.reset()
-    history = []
-    moves = 0
-    while game.winner is None:
-        player = game.current_player
-        agent = agent_black if player == 1 else agent_white
-        state = game.get_state()
-        valid = game.get_valid_actions_idx()
-        if not valid:
-            game.winner = 0
-            break
-        action = agent.act(state, valid)
-        reward, done = game.make_move(action)
-        next_state = game.get_state()
-        history.append((player, state.copy(), action, reward, next_state.copy(), done))
-        moves += 1
-
-    winner = game.winner
-    for p, s, a, r, ns, d in history:
-        total = r + (1.0 if d and winner == p else 0.0)
-        if p == 1:
-            agent_black.remember(s, a, total, ns, d)
+    def refresh_snapshots(self):
+        snaps = self.find_snapshots()
+        values = [str(e) for e in snaps]
+        self.snap_combo["values"] = values
+        if values:
+            self.snap_combo.current(len(values) - 1)   # 默认选中最新
+            self.load_selected()
         else:
-            agent_white.remember(s, a, total, ns, d)
+            self.snap_combo.set("")
+            self.model_info = "未找到快照"
+            self.update_status()
+            messagebox.showwarning(
+                "未找到存档",
+                f"在 {os.path.abspath(SAVE_ROOT)} 下没有找到 "
+                f"<局数>/{SUB_DIR}/ 目录。\n请先运行训练脚本产生存档。")
 
-    lb = agent_black.replay()
-    lw = agent_white.replay()
-    losses = [l for l in (lb, lw) if l is not None]
-    avg_loss = float(np.mean(losses)) if losses else 0.0
-    return winner, moves, avg_loss
+    def load_selected(self):
+        s = self.snap_var.get()
+        if not s:
+            return
+        ep = int(s)
+        snap = os.path.join(SAVE_ROOT, str(ep), SUB_DIR)
+        try:
+            db = self.agent_black.load_json(os.path.join(snap, "black.json"))
+            dw = self.agent_white.load_json(os.path.join(snap, "white.json"))
+        except Exception as e:
+            messagebox.showerror("载入失败", str(e))
+            return
 
+        eb = float(db.get("epsilon", 0.0))
+        ew = float(dw.get("epsilon", 0.0))
+        ub = int(db.get("updates", 0))
+        uw = int(dw.get("updates", 0))
+        self.model_info = (f"快照 {ep} | 黑: ε={eb:.3f} upd={ub} | "
+                           f"白: ε={ew:.3f} upd={uw}")
 
-# -------------------- 主循环 --------------------
-def main():
-    game = GoBangGame()
-    agent_black = DQNAgent("black")
-    agent_white = DQNAgent("white")
+        self.new_game()      # 载入后自动开新局
 
-    # ---- 恢复进度（从最新的快照目录） ----
-    episode = 0
-    b_wins = w_wins = draws = 0
-    latest = find_latest_snapshot()
-    if latest > 0:
-        snap = snapshot_dir(latest)
-        print(f"[恢复] 发现最新快照：{snap}")
-        meta = load_meta(os.path.join(snap, "meta.json"))
-        if meta:
-            episode = meta["episode"]
-            b_wins  = meta["b_wins"]
-            w_wins  = meta["w_wins"]
-            draws   = meta["draws"]
-            print(f"[meta] episode={episode}, 黑胜={b_wins}, 白胜={w_wins}, 平={draws}")
-        agent_black.load_json(os.path.join(snap, "black.json"))
-        agent_white.load_json(os.path.join(snap, "white.json"))
-    else:
-        print("[提示] 未发现历史快照，从零开始训练。")
+    # ---------------- 对局控制 ----------------
+    def new_game(self):
+        mode = self.mode_var.get()
+        self.human_color = {"human_black": 1,
+                            "human_white": 2,
+                            "ai_vs_ai": None}[mode]
 
-    print(f"\n开始训练（Ctrl+C 中断并保存）...  当前 episode={episode}")
-    print(f"自动保存规则：每 {AUTO_SAVE_INTERVAL} 局 → {SAVE_ROOT}/<局数>/{SUB_DIR}/\n")
+        self.game_id += 1
+        self.board = [[0] * BOARD_SIZE for _ in range(BOARD_SIZE)]
+        self.current = 1
+        self.winner = None
+        self.last_move = None
+        self.history = []
+        self.busy = False
 
-    try:
-        while True:
-            winner, moves, avg_loss = train_step(agent_black, agent_white, game)
-            episode += 1
+        self.draw_board()
+        self.update_status()
+        self.maybe_ai_move()
 
-            if winner == 1:
-                b_wins += 1
-            elif winner == 2:
-                w_wins += 1
+    def undo(self):
+        if self.busy or not self.history:
+            return
+        while self.history:
+            i, j, p = self.history.pop()
+            self.board[i][j] = 0
+            self.current = p
+            self.winner = None
+            if self.human_color is None or self.current == self.human_color:
+                break
+        self.last_move = self.history[-1][:2] if self.history else None
+        self.draw_board()
+        self.update_status()
+
+    def on_click(self, event):
+        if self.busy or self.winner is not None:
+            return
+        if self.human_color is None or self.current != self.human_color:
+            return
+
+        j = int(round((event.x - MARGIN) / CELL))
+        i = int(round((event.y - MARGIN) / CELL))
+        if not (0 <= i < BOARD_SIZE and 0 <= j < BOARD_SIZE):
+            return
+        if self.board[i][j] != 0:
+            return
+        self.place(i, j)
+
+    def place(self, i, j):
+        if self.winner is not None or self.board[i][j] != 0:
+            return
+
+        p = self.current
+        self.board[i][j] = p
+        self.history.append((i, j, p))
+        self.last_move = (i, j)
+        self.draw_board()
+
+        if self.check_winner(i, j):
+            self.winner = p
+            self.update_status()
+            return
+
+        if not self.get_valid_actions_idx():
+            self.winner = 0
+            self.update_status()
+            return
+
+        self.current = 3 - p
+        self.update_status()
+        self.maybe_ai_move()
+
+    # ---------------- AI 调度 ----------------
+    def maybe_ai_move(self):
+        if self.winner is not None or self.busy:
+            return
+        if self.human_color is not None and self.current == self.human_color:
+            return
+        self.busy = True
+        gid = self.game_id
+        self.root.after(60, lambda: self._do_ai_move(gid))
+
+    def _do_ai_move(self, gid):
+        if gid != self.game_id or self.winner is not None:
+            self.busy = False
+            return
+
+        agent = self.agent_black if self.current == 1 else self.agent_white
+        if not agent.loaded:
+            self.busy = False
+            messagebox.showwarning("未载入模型",
+                                   "还没有载入 AI 权重，请先选择快照并点击【载入】。")
+            return
+
+        valid = self.get_valid_actions_idx()
+        if not valid:
+            self.busy = False
+            return
+
+        idx = agent.act(self.get_state(), valid)
+        i, j = divmod(idx, BOARD_SIZE)
+        if self.board[i][j] != 0:          # 兜底，正常不会发生
+            i, j = divmod(valid[0], BOARD_SIZE)
+
+        self.busy = False
+        self.place(i, j)
+
+    # ---------------- 规则 / 状态 ----------------
+    def get_state(self):
+        """与训练脚本 get_state 完全一致：黑=+1，白=-1，绝对视角。"""
+        s = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+        for i in range(BOARD_SIZE):
+            for j in range(BOARD_SIZE):
+                if self.board[i][j] == 1:
+                    s[i][j] = 1.0
+                elif self.board[i][j] == 2:
+                    s[i][j] = -1.0
+        return s
+
+    def get_valid_actions_idx(self):
+        return [i * BOARD_SIZE + j
+                for i in range(BOARD_SIZE)
+                for j in range(BOARD_SIZE)
+                if self.board[i][j] == 0]
+
+    def check_winner(self, i, j):
+        player = self.board[i][j]
+        for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
+            cnt = 1
+            for step in (1, -1):
+                x, y = i + dx * step, j + dy * step
+                while (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE
+                       and self.board[x][y] == player):
+                    cnt += 1
+                    x += dx * step
+                    y += dy * step
+            if cnt >= 5:
+                return True
+        return False
+
+    # ---------------- 绘制 ----------------
+    def draw_board(self):
+        self.canvas.delete("all")
+        n = BOARD_SIZE
+        x0 = y0 = MARGIN
+        x1 = y1 = MARGIN + CELL * (n - 1)
+
+        for k in range(n):
+            self.canvas.create_line(x0, y0 + k * CELL, x1, y0 + k * CELL, fill="#6B4A22")
+            self.canvas.create_line(x0 + k * CELL, y0, x0 + k * CELL, y1, fill="#6B4A22")
+
+        # 星位
+        for si in (3, 6, 9):
+            for sj in (3, 6, 9):
+                cx, cy = MARGIN + sj * CELL, MARGIN + si * CELL
+                self.canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3,
+                                        fill="#6B4A22", outline="")
+
+        # 棋子
+        r = CELL * 0.42
+        for i in range(n):
+            for j in range(n):
+                p = self.board[i][j]
+                if p == 0:
+                    continue
+                cx, cy = MARGIN + j * CELL, MARGIN + i * CELL
+                if p == 1:
+                    self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                            fill="#1A1A1A", outline="#000000")
+                else:
+                    self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                            fill="#FAFAFA", outline="#888888")
+
+        # 最后一手标记
+        if self.last_move:
+            i, j = self.last_move
+            cx, cy = MARGIN + j * CELL, MARGIN + i * CELL
+            self.canvas.create_oval(cx - 5, cy - 5, cx + 5, cy + 5,
+                                    outline="#E53935", width=2)
+
+    def update_status(self):
+        if self.winner == 1:
+            state = "● 黑棋 获胜！"
+        elif self.winner == 2:
+            state = "○ 白棋 获胜！"
+        elif self.winner == 0:
+            state = "平局！"
+        else:
+            who = "黑棋" if self.current == 1 else "白棋"
+            if self.human_color is None:
+                who += "（AI）"
+            elif self.current == self.human_color:
+                who += "（你）"
             else:
-                draws += 1
+                who += "（AI）"
+            state = f"轮到 {who} 落子"
 
-            if episode % TARGET_UPDATE_INTERVAL == 0:
-                agent_black.update_target()
-                agent_white.update_target()
+        self.status_var.set(f"{state}      {self.model_info}")
 
-            w_str = "黑胜" if winner == 1 else "白胜" if winner == 2 else "平局"
-            print(f"[{episode:>6}] {w_str} | 步数={moves:>3} | loss={avg_loss:.4f} "
-                  f"| ε_黑={agent_black.epsilon:.3f} ε_白={agent_white.epsilon:.3f}")
 
-            if episode % AUTO_SAVE_INTERVAL == 0:
-                snap = snapshot_dir(episode)
-                print(f"\n==== 自动保存 @ {episode} 局 → {snap} ====")
-                agent_black.save_json(os.path.join(snap, "black.json"))
-                agent_white.save_json(os.path.join(snap, "white.json"))
-                save_meta(os.path.join(snap, "meta.json"),
-                          episode, b_wins, w_wins, draws)
-                print(f"==== 保存完成 ====\n")
-
-    except KeyboardInterrupt:
-        # 手动中断：保存到下一个 500 边界目录，避免与已有快照冲突
-        save_ep = ((episode // AUTO_SAVE_INTERVAL) + 1) * AUTO_SAVE_INTERVAL
-        snap = snapshot_dir(save_ep)
-        print(f"\n手动中断，保存当前进度到 {snap} ...")
-        agent_black.save_json(os.path.join(snap, "black.json"))
-        agent_white.save_json(os.path.join(snap, "white.json"))
-        save_meta(os.path.join(snap, "meta.json"),
-                  episode, b_wins, w_wins, draws)
-        print("已保存，退出。")
+# ------------------------------------------------------------
+def main():
+    root = tk.Tk()
+    try:
+        # 高 DPI 屏幕下更清晰（Windows 可用，其他平台忽略）
+        root.tk.call("tk", "scaling", 1.2)
+    except Exception:
+        pass
+    GoBangGUI(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
