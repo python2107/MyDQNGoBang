@@ -287,13 +287,23 @@ class GoBangFrame(wx.Frame):
         self.status_text = wx.StaticText(panel, label="")
         f = self.status_text.GetFont()
         f.SetPointSize(f.GetPointSize() + 1)
-        f.MakeBold(True)
+        f.MakeBold()
         self.status_text.SetFont(f)
         outer.Add(self.status_text, 0, wx.EXPAND | wx.ALL, 8)
 
         panel.SetSizer(outer)
-        self.Fit()
-        self.SetMinSize(self.GetSize())
+
+        # —— 显式计算窗口尺寸（不依赖 Fit 的自动推算） ——
+        # 宽度 = 棋盘区 + 侧栏区 + 各种边距
+        #   棋盘：BOARD_PX + 左右各 6
+        #   侧栏：SIDEBAR_W + 右 6
+        #   再加一个 40 冗余（边框 + 滚动条余量）
+        win_w = BOARD_PX + SIDEBAR_W + 6 * 3 + 40
+        # 高度 = 棋盘区 + 底部状态栏 + 上下边距
+        win_h = BOARD_PX + 6 * 2 + 46
+        self.SetClientSize((win_w, win_h))
+        # 锁定初始 / 最小尺寸，防止用户拖动缩到看不见
+        self.SetSizeHints(win_w, win_h, -1, -1)
 
     def _legend_bitmap(self, color_hex):
         bmp = wx.Bitmap(18, 18)
